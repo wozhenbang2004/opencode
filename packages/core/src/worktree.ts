@@ -1,7 +1,7 @@
 export * as Worktree from "./worktree.js"
 
 import { Context, Effect, Layer, Schema } from "effect"
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm"
+import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm"
 import path from "path"
 import { AbsolutePath } from "./schema.js"
 import { FSUtil } from "@opencode/util/fs-util"
@@ -111,6 +111,7 @@ const layer = Layer.effect(
     const db = database.db
     const bus = yield* Bus.Service
     const processService = yield* AppProcess.Service
+    const git = yield* Git.Service
     const locations = yield* LocationServiceMap.Service
     const project = Effect.fnUntraced(function* (projectID: Project.ID) {
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
@@ -261,6 +262,8 @@ const layer = Layer.effect(
       if (!stored?.strategy) return yield* new InvalidDirectoryError({ directory: worktreeDirectory })
       const settings = yield* load(row.worktree, current)
       const strategy = yield* getStrategy(stored.strategy, settings.strategies)
+      if (worktreeDirectory === (yield* fs.resolve(row.worktree)))
+        return yield* new InvalidDirectoryError({ directory: worktreeDirectory })
       yield* strategy
         .remove({
           directory: worktreeDirectory,
@@ -276,6 +279,20 @@ const layer = Layer.effect(
     ) {
       const row = yield* project(input.projectID)
       const settings = yield* load(row.worktree, current)
+      const others = yield* db
+        .select({ directory: ProjectTable.worktree })
+        .from(ProjectTable)
+        .where(ne(ProjectTable.id, input.projectID))
+        .all()
+        .pipe(Effect.orDie)
+      const repository = yield* git.repo.discover(row.worktree)
+      // Project roots and Git's metadata directory are not this project's managed children.
+      const excluded = new Set([
+        ...(yield* Effect.forEach(others, (item) => fs.resolve(item.directory))).filter(
+          (directory) => directory !== row.worktree,
+        ),
+        ...(repository ? [repository.commonDirectory] : []),
+      ])
       const stored = yield* ops.list(input.projectID)
       const checked = yield* Effect.forEach(
         stored,
@@ -290,6 +307,7 @@ const layer = Layer.effect(
         ...checked.filter((item) => item.exists && !item.strategy).map((item) => item.directory),
       ])
       for (const directory of roots) {
+        if (excluded.has(directory)) continue
         if (!(yield* fs.isDir(directory))) continue
         for (const strategy of strategies) {
           const entries = yield* strategy.list(directory).pipe(
@@ -304,15 +322,20 @@ const layer = Layer.effect(
             const directory = yield* canonical(fs, entry.directory).pipe(
               Effect.catchTag("Worktree.DirectoryUnavailableError", () => Effect.undefined),
             )
-            if (!directory || discovered.has(directory)) continue
+            if (!directory || excluded.has(directory) || discovered.has(directory)) continue
             discovered.set(directory, {
               directory,
-              strategy: entry.type === "worktree" ? strategy.id : undefined,
+              strategy: directory !== row.worktree && entry.type === "worktree" ? strategy.id : undefined,
+              replace:
+                directory === row.worktree &&
+                stored.some((item) => item.directory === directory && item.strategy === "git"),
             })
           }
         }
       }
-      const removed = checked.filter((item) => !item.exists).map((item) => item.directory)
+      const removed = checked
+        .filter((item) => !item.exists || ((!item.strategy || item.strategy === "git") && excluded.has(item.directory)))
+        .map((item) => item.directory)
       const changes = yield* db
         .transaction((tx) =>
           Effect.all({
@@ -341,7 +364,7 @@ const layer = Layer.effect(
 export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.global> = Node.makeGlobalNode({
   service: Service,
   layer,
-  deps: [FSUtil.node, Bus.node, Database.node, AppProcess.node, LocationServiceMap.node],
+  deps: [FSUtil.node, Bus.node, Database.node, AppProcess.node, Git.node, LocationServiceMap.node],
 })
 
 function operationError(strategy: StrategyID, operation: string, error: unknown) {
