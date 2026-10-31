@@ -28,11 +28,13 @@ export const make = Effect.gen(function* () {
       const repository = yield* git.repo.discover(directory)
       if (!repository) return yield* new DirectoryUnavailableError({ directory })
       const entries = yield* git.worktree.list(repository)
-      return yield* Effect.forEach(entries, (entry) =>
-        canonical(fs, entry.directory).pipe(
-          Effect.map((directory) => ({ directory, type: entry.kind === "main" ? "root" : "worktree" }) as const),
-          Effect.catchTag("Worktree.DirectoryUnavailableError", () => Effect.undefined),
-        ),
+      return yield* Effect.forEach(
+        entries.filter((entry) => entry.directory !== repository.commonDirectory),
+        (entry) =>
+          canonical(fs, entry.directory).pipe(
+            Effect.map((directory) => ({ directory, type: entry.kind === "main" ? "root" : "worktree" }) as const),
+            Effect.catchTag("Worktree.DirectoryUnavailableError", () => Effect.undefined),
+          ),
       ).pipe(Effect.map((items) => items.filter((item): item is Worktree.ListEntry => item !== undefined)))
     }),
   } satisfies Strategy
