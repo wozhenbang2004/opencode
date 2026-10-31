@@ -136,8 +136,9 @@ function stored(projectID: Project.ID) {
       .all()
       .pipe(
         Effect.orDie,
-        Effect.map((rows): Array<{ directory: AbsolutePath; strategy: string | null }> =>
-          rows.toSorted((a, b) => a.directory.localeCompare(b.directory)),
+        Effect.map(
+          (rows): Array<{ directory: AbsolutePath; strategy: string | null }> =>
+            rows.toSorted((a, b) => a.directory.localeCompare(b.directory)),
         ),
       ),
   )
@@ -644,6 +645,130 @@ describe("Worktree", () => {
       yield* Effect.promise(() => $`git worktree remove --force ${unchanged}`.cwd(input.root.path).quiet())
       yield* worktree.refresh()
       expect(yield* stored(input.projectID)).toEqual([{ directory: input.sourceDirectory, strategy: null }])
+    }),
+  )
+
+  it.live("refresh keeps another project's root out of its Git worktree inventory", () =>
+    Effect.gen(function* () {
+      const input = yield* setup()
+      const sibling = abs(path.join(input.root.path, "sibling"))
+      const child = abs(path.join(input.root.path, "child"))
+      yield* Effect.promise(async () => {
+        await $`git worktree add --detach ${sibling} HEAD`.cwd(input.sourceDirectory).quiet()
+        await $`git worktree add --detach ${child} HEAD`.cwd(input.sourceDirectory).quiet()
+      })
+      const other = Project.ID.make("sibling-project")
+      yield* input.db
+        .insert(ProjectTable)
+        .values({ id: other, worktree: sibling, sandboxes: [], time_created: 1, time_updated: 1 })
+        .run()
+        .pipe(Effect.orDie)
+      yield* input.db
+        .insert(WorktreeTable)
+        .values([
+          { project_id: other, directory: sibling },
+          { project_id: input.projectID, directory: sibling, strategy: Worktree.StrategyID.make("git") },
+          { project_id: other, directory: input.sourceDirectory, strategy: Worktree.StrategyID.make("git") },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+      const worktree = yield* fixtureWorktree()
+      yield* worktree.refresh()
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const context = yield* Layer.build(worktreeLayer(sibling, other, database, bus, input.root.path))
+      yield* Context.get(context, Worktree.Service).refresh(
+        { projectID: other },
+        Context.get(context, WorktreeStrategies.Service),
+      )
+
+      expect(yield* stored(input.projectID)).toEqual(
+        [
+          { directory: input.sourceDirectory, strategy: null },
+          { directory: child, strategy: "git" },
+        ].toSorted((a, b) => a.directory.localeCompare(b.directory)),
+      )
+      expect(yield* stored(other)).toEqual(
+        [
+          { directory: sibling, strategy: null },
+          { directory: child, strategy: "git" },
+        ].toSorted((a, b) => a.directory.localeCompare(b.directory)),
+      )
+
+      yield* input.db
+        .insert(WorktreeTable)
+        .values({
+          project_id: input.projectID,
+          directory: sibling,
+          strategy: Worktree.StrategyID.make("custom"),
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* worktree.refresh()
+      expect(yield* stored(input.projectID)).toContainEqual({ directory: sibling, strategy: "custom" })
+    }),
+  )
+
+  it.live("refresh excludes a bare repository already recorded as a discovery root", () =>
+    Effect.gen(function* () {
+      const input = yield* setup()
+      const bare = abs(path.join(input.root.path, "bare.git"))
+      const first = abs(path.join(input.root.path, "first"))
+      const second = abs(path.join(input.root.path, "second"))
+      yield* Effect.promise(async () => {
+        await $`git clone --bare ${input.sourceDirectory} ${bare}`.quiet()
+        await $`git --git-dir ${bare} worktree add --detach ${first} HEAD`.quiet()
+        await $`git --git-dir ${bare} worktree add --detach ${second} HEAD`.quiet()
+      })
+      yield* input.db
+        .update(ProjectTable)
+        .set({ worktree: first })
+        .where(eq(ProjectTable.id, input.projectID))
+        .run()
+        .pipe(Effect.orDie)
+      yield* input.db
+        .delete(WorktreeTable)
+        .where(eq(WorktreeTable.project_id, input.projectID))
+        .run()
+        .pipe(Effect.orDie)
+      yield* input.db
+        .insert(WorktreeTable)
+        .values([
+          { project_id: input.projectID, directory: first },
+          { project_id: input.projectID, directory: bare },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const context = yield* Layer.build(worktreeLayer(first, input.projectID, database, bus, input.root.path))
+      const strategies = Context.get(context, WorktreeStrategies.Service)
+      const service = Context.get(context, Worktree.Service)
+      const git = yield* WorktreeGit.make
+      expect(yield* git.list(first)).toEqual([
+        { directory: first, type: "worktree" },
+        { directory: second, type: "worktree" },
+      ])
+      yield* service.refresh({ projectID: input.projectID }, strategies)
+      yield* service.refresh({ projectID: input.projectID }, strategies)
+
+      expect(yield* stored(input.projectID)).toEqual([
+        { directory: first, strategy: null },
+        { directory: second, strategy: "git" },
+      ])
+      yield* input.db
+        .update(WorktreeTable)
+        .set({ strategy: Worktree.StrategyID.make("git") })
+        .where(and(eq(WorktreeTable.project_id, input.projectID), eq(WorktreeTable.directory, first)))
+        .run()
+        .pipe(Effect.orDie)
+      const error = yield* service
+        .remove({ projectID: input.projectID, directory: first, force: true }, strategies)
+        .pipe(Effect.flip)
+      expect(error).toBeInstanceOf(Worktree.InvalidDirectoryError)
+      yield* service.refresh({ projectID: input.projectID }, strategies)
+      expect(yield* stored(input.projectID)).toContainEqual({ directory: first, strategy: null })
+      expect((yield* Effect.promise(() => fs.stat(first))).isDirectory()).toBe(true)
     }),
   )
 
